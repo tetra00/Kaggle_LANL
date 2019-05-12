@@ -1,0 +1,1392 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# BASIC IDEA OF THE KERNEL\n",
+    "\n",
+    "The data consists of a one dimensional time series x with 600 Mio data points. \n",
+    "\n",
+    "At test time, we will see a time series of length 150'000 to predict the next earthquake.\n",
+    "\n",
+    "The idea of this kernel is to randomly sample chunks of length 150'000 from x, \n",
+    "\n",
+    "derive some features and use them to update weights of a recurrent neural net with 150'000 / 1000 = 150 time steps. "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {
+    "slideshow": {
+     "slide_type": "-"
+    }
+   },
+   "outputs": [],
+   "source": [
+    "import numpy as np \n",
+    "import pandas as pd\n",
+    "import os\n",
+    "from tqdm import tqdm, tqdm_notebook\n",
+    "from scipy import stats\n",
+    "from random import choice\n",
+    "\n",
+    "from scipy.signal import hilbert, hann, convolve\n",
+    "from sklearn.linear_model import LinearRegression\n",
+    "\n",
+    "#from joblib import Parallel, delayed\n",
+    "\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn\n",
+    "%matplotlib inline\n",
+    "\n",
+    "# Fix seeds\n",
+    "from numpy.random import seed\n",
+    "seed(639)\n",
+    "from tensorflow import set_random_seed\n",
+    "set_random_seed(5944)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# df_train = pd.read_csv(\"../input/train.csv\", dtype={\"acoustic_data\": np.float32, \"time_to_failure\": np.float32})\n",
+    "# df_train.to_hdf(\"../input/train.hdf\", key='0')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Import\n",
+    "#float_data = pd.read_csv(\"../input/train.csv\", dtype={\"acoustic_data\": np.float32, \"time_to_failure\": np.float32}).values\n",
+    "df_train = pd.read_hdf(\"../input/train.hdf\", key='0')\n",
+    "\n",
+    "float_data = df_train.values\n",
+    "acoustic_data = df_train['acoustic_data'].values\n",
+    "time_to_failures = df_train['time_to_failure'].values"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# The generator endlessly selects \"batch_size\" ending positions of sub-time series. For each ending position,\n",
+    "# the \"time_to_failure\" serves as target, while the features are created by the function \"create_X\".\n",
+    "class DataGenerator():\n",
+    "    def __init__(self, acoustic_data, time_to_failures, n_segment=3, min_index=0, max_index=None, \n",
+    "                 batch_size=32, n_step=150, step_length=1000, normalize=False, verbose=0):\n",
+    "        self.verbose = verbose \n",
+    "        self.normalize = normalize \n",
+    "        \n",
+    "        # Normalize\n",
+    "        self.avg_acoustic_data = acoustic_data.mean()\n",
+    "        self.std_acoustic_data = acoustic_data.std()\n",
+    "        if self.normalize:\n",
+    "            self.acoustic_data = (acoustic_data - self.avg_acoustic_data) / self.std_acoustic_data\n",
+    "        else:   \n",
+    "            self.acoustic_data = acoustic_data\n",
+    "        self.min_acoustic_data = acoustic_data.min()\n",
+    "\n",
+    "        self.time_to_failures = time_to_failures\n",
+    "        if self.verbose > 0:\n",
+    "            print('[init] acoustic_data.shape=', acoustic_data.shape, ', time_to_failures.shape=', time_to_failures.shape,)\n",
+    "        \n",
+    "        self.n_segment = n_segment\n",
+    "        \n",
+    "        self.min_index = min_index        \n",
+    "        if max_index is None:\n",
+    "            max_index = len(acoustic_data) - 1\n",
+    "        self.max_index = max_index\n",
+    "        \n",
+    "        self.batch_size = batch_size\n",
+    "        self.n_step = n_step\n",
+    "        self.step_length = step_length\n",
+    "    \n",
+    "        # n_step*step_length=150000以上のデータ数がある区間をsegmentとして登録\n",
+    "        self.segment_length = len(self.acoustic_data)//self.n_segment\n",
+    "        \n",
+    "        # If segemnt is too small to get sample data, return error.\n",
+    "        assert self.n_step * self.step_length <= self.segment_length - 1\n",
+    "    \n",
+    "        if self.verbose > 0:\n",
+    "            print('[init]', end='')\n",
+    "        self.n_feature = self.create_X(acoustic_data[0:n_step*step_length]).shape[1]     \n",
+    "        #self.n_feature = 3*9 # 特徴量追加時に修正\n",
+    " \n",
+    "        self.segment_last_indexs = [0]\n",
+    "        for i in range(self.n_segment):\n",
+    "            if i+1 == self.n_segment:\n",
+    "                self.segment_last_indexs.append(self.max_index)\n",
+    "            else:\n",
+    "                self.segment_last_indexs.append(self.segment_length*(i+1))\n",
+    "       \n",
+    "        # Validationデータの生成区間（初期値はsegment_0）\n",
+    "        self.valid_segment = 0\n",
+    "        self.min_valid_index = -1    \n",
+    "        self.max_valid_index = -1\n",
+    "        self.set_valid_segment(self.valid_segment)\n",
+    "    \n",
+    "        # 過去に生成したデータのキャッシュ\n",
+    "        self.last_index_to_gen_sample = {}\n",
+    "\n",
+    "    def set_valid_segment(self, valid_segment):\n",
+    "        \"\"\"\n",
+    "        Validationデータの生成区間を指定\n",
+    "        \"\"\"\n",
+    "        self.valid_segment = valid_segment\n",
+    "        self.min_valid_index = self.segment_last_indexs[self.valid_segment]     \n",
+    "        self.max_valid_index = self.segment_last_indexs[self.valid_segment+1]\n",
+    "\n",
+    "    def generate_train(self):\n",
+    "        \"\"\"\n",
+    "        Return train-data generator\n",
+    "        \"\"\"\n",
+    "        \n",
+    "        while True:       \n",
+    "            # 全区間からvalidの区間を除く区間からデータを生成するGeneratorを返す\n",
+    "            yield self.pick_random_data(self.min_index, self.max_index, self.min_valid_index, self.max_valid_index)\n",
+    "\n",
+    "    def generate_valid(self):\n",
+    "        \"\"\"\n",
+    "        Return valid-data generator\n",
+    "        \"\"\"\n",
+    "        while True:       \n",
+    "            # validの区間からデータを生成するGeneratorを返す\n",
+    "            yield self.pick_random_data(self.min_valid_index, self.max_valid_index)\n",
+    "            \n",
+    "    def convert_test(self, test_acoustic_data):\n",
+    "        \"\"\"\n",
+    "        CSVファイルから読み込んだままのテストデータを入力して\n",
+    "        学習時と同条件の正規化・特徴量変換したデータを返す\n",
+    "        \"\"\"\n",
+    "        if self.normalize:\n",
+    "            x_test = (test_acoustic_data - self.avg_acoustic_data) / self.std_acoustic_data           \n",
+    "        else:   \n",
+    "            x_test = test_acoustic_data\n",
+    "        return np.expand_dims(self.create_X(x_test), 0)\n",
+    "\n",
+    "    def pick_random_data(self, min_pick_index, max_pick_index, min_reject_index=None, max_reject_index=None):\n",
+    "        \"\"\"\n",
+    "        Return samples & targets between min_pick_index ~ max_pick_index randomly\n",
+    "        \"\"\"\n",
+    "        # data_length分のデータを抽出可能なようにマージンを持たせてindexをランダムサンプリングする\n",
+    "        data_length = self.n_step * self.step_length\n",
+    "        \n",
+    "        if self.verbose > 0:\n",
+    "            print('[get_random_pick_data]',\n",
+    "                  'min/max_pick_index=', min_pick_index, max_pick_index, \n",
+    "                  'min/max_reject_index=', min_reject_index, max_reject_index,\n",
+    "                  'data_length=', data_length)\n",
+    "        \n",
+    "        # If segemnt is too small to get sample data, return error.\n",
+    "        assert min_pick_index + data_length < max_pick_index\n",
+    "   \n",
+    "        if min_reject_index is not None and max_reject_index is not None:\n",
+    "            # Pick indices of ending positions except min_reject_index ~ max_reject_index\n",
+    "            idxs = self.get_randint(size=self.batch_size, \n",
+    "                                    min_pick_index=min_pick_index + data_length, \n",
+    "                                    max_pick_index=max_pick_index, \n",
+    "                                    min_reject_index=min_reject_index,\n",
+    "                                    max_reject_index=max_reject_index + data_length)\n",
+    "        else:\n",
+    "            # Pick indices of ending positions\n",
+    "            idxs = np.random.randint(min_pick_index + data_length, max_pick_index, size=self.batch_size)\n",
+    "\n",
+    "        # Initialize feature matrices and targets\n",
+    "        samples = np.zeros((self.batch_size, self.n_step, self.n_feature))\n",
+    "        targets = np.zeros(self.batch_size, )\n",
+    "        \n",
+    "        for j, idx in enumerate(idxs):\n",
+    "            if self.verbose > 0:\n",
+    "                print('[get_random_pick_data] ', j, '/', self.batch_size)\n",
+    "            if idx not in self.last_index_to_gen_sample:\n",
+    "                self.last_index_to_gen_sample[idx] = self.create_X(self.acoustic_data, last_index=idx)\n",
+    "                \n",
+    "            #print(self.last_index_to_gen_sample[r])\n",
+    "            samples[j] = self.last_index_to_gen_sample[idx]\n",
+    "            targets[j] = self.time_to_failures[idx-1]\n",
+    "        return samples, targets\n",
+    "\n",
+    "    def get_randint(self, size, min_pick_index, max_pick_index, min_reject_index=None, max_reject_index=None):\n",
+    "        \"\"\"\n",
+    "        min_pick_index <= idx <= max_pick_index の範囲にあり、\n",
+    "        min_reject_index <= idx <= max_reject_index の範囲に含まれない\n",
+    "        ランダムなsize個の整数列を生成する\n",
+    "        \"\"\"\n",
+    "        \n",
+    "        assert min_pick_index < max_pick_index\n",
+    "        assert min_reject_index < max_reject_index\n",
+    "        \n",
+    "        if min_reject_index is None or max_reject_index is None:\n",
+    "            # どちらかの除外区間なしの場合はrandintをそのまま使う\n",
+    "            return np.random.randint(min_pick_index, max_pick_index, n_sample)\n",
+    "\n",
+    "        rand_indexs = []\n",
+    "        while len(rand_indexs) < size:\n",
+    "            idx = np.random.randint(min_pick_index, max_pick_index)     \n",
+    "            if idx < min_reject_index or max_reject_index < idx:\n",
+    "                rand_indexs.append(idx)\n",
+    "\n",
+    "        return rand_indexs\n",
+    "\n",
+    "    def create_X(self, acoustic_data, last_index=None, n_step=None, step_length=None):\n",
+    "        \"\"\"\n",
+    "        For a given ending position \"last_index\", we split the last 150'000 values \n",
+    "        of \"x\" into 150 pieces of length 1000 each. So n_step * step_length should equal 150'000.\n",
+    "        From each piece, a set features are extracted. This results in a feature matrix \n",
+    "        of dimension (150 time steps x features).  \n",
+    "        \"\"\"\n",
+    "        if last_index == None:\n",
+    "            last_index=len(acoustic_data)\n",
+    "        if n_step == None:    \n",
+    "            n_step=self.n_step\n",
+    "        if step_length == None:                                                               \n",
+    "            step_length=self.step_length\n",
+    "            \n",
+    "        assert last_index - n_step * step_length >= 0\n",
+    "\n",
+    "        if self.verbose > 0:\n",
+    "            print('[create_X] last_index=', last_index, ', n_step=', n_step, ', step_length=', step_length, ', acoustic_data.shape=', acoustic_data.shape)\n",
+    "            \n",
+    "        # Reshaping and approximate standardization with mean 5 and std 3.\n",
+    "        #tmp_data = (acoustic_data[(last_index - n_step * step_length):last_index].reshape(n_step, -1) - 5 ) / 3\n",
+    "        tmp_data = acoustic_data[(last_index - n_step * step_length):last_index].reshape(n_step, -1)\n",
+    "        \n",
+    "        # Extracts features of sequences of full length 1000, of the last 100 and 10 observations. \n",
+    "        feats = np.c_[self.extract_features(tmp_data),\n",
+    "                      self.extract_features(tmp_data[:, -step_length // 10:]),\n",
+    "                      self.extract_features(tmp_data[:, -step_length // 100:])]\n",
+    "        \n",
+    "        if self.verbose >= 2:\n",
+    "            print('feature matrix=')\n",
+    "            print(feats)\n",
+    "        \n",
+    "        return feats\n",
+    "\n",
+    "    def get_rolling_std_quantiles(self, z, window, quantiles):\n",
+    "        \"\"\"\n",
+    "        2次元配列z(m*n幅windowごとに標準偏差をとり\n",
+    "        そのquantile点(k個)を抽出したm*k行列(ndarray)を返す\n",
+    "        \"\"\"\n",
+    "        if self.verbose > 0:\n",
+    "            print('[get_rolling_std_quantiles] z.shape =', z.shape, ',  window=', window, ', quantiles=', quantiles)\n",
+    "            \n",
+    "        feats = np.zeros([z.shape[0], len(quantiles)])\n",
+    "        for i in range(z.shape[0]):\n",
+    "            # Windowを変化させrolling特徴量を生成\n",
+    "            #zs_i = pd.Series(z[i])\n",
+    "            #z_roll_std_i = zs_i.rolling(window).std().dropna().values\n",
+    "            z_roll_std_i = self.rolling_window(z, window).std(axis=1)\n",
+    "            for j,q in enumerate(quantiles):\n",
+    "                feats[i,j] = np.quantile(z_roll_std_i, q)\n",
+    "                \n",
+    "        return feats\n",
+    "    \n",
+    "    def rolling_window(self, a, window):\n",
+    "        shape = a.shape[:-1] + (a.shape[-1] - window + 1, window)\n",
+    "        strides = a.strides + (a.strides[-1],)\n",
+    "        return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)\n",
+    "    \n",
+    "    def extract_features(self, z):\n",
+    "        \"\"\"\n",
+    "        Helper function for the data generator. Extracts mean, standard deviation, and quantiles per time step.\n",
+    "        Can easily be extended. Expects a two dimensional array.\n",
+    "        z:2D-array(m*n)\n",
+    "        return:features(m*x)\n",
+    "        \"\"\"\n",
+    "        if self.verbose > 0:\n",
+    "            print('[extract_features] z.shape=' ,z.shape)\n",
+    "\n",
+    "        z_abs_diff = np.abs(np.diff(z, axis=1))\n",
+    "\n",
+    "        features = np.c_[z.mean(axis=1), \n",
+    "                         z.min(axis=1),\n",
+    "                         z.max(axis=1),\n",
+    "                         z.std(axis=1),\n",
+    "#                          np.quantile(z,0.05, axis=1),\n",
+    "#                          np.quantile(z,0.10, axis=1),\n",
+    "#                          np.quantile(z,0.90, axis=1),\n",
+    "#                          np.quantile(z,0.95, axis=1),\n",
+    "                         (z**2).mean(axis=1),\n",
+    "                         (1/(z+0.01)).mean(axis=1),\n",
+    "                         np.log(np.abs(z)+1).mean(axis=1),   \n",
+    "                         z_abs_diff.mean(axis=1),\n",
+    "                         z_abs_diff.min(axis=1),\n",
+    "                         z_abs_diff.max(axis=1),\n",
+    "                         z_abs_diff.std(axis=1),\n",
+    "#                          np.quantile(z_abs_diff,0.05, axis=1),\n",
+    "#                          np.quantile(z_abs_diff,0.10, axis=1),\n",
+    "#                          np.quantile(z_abs_diff,0.90, axis=1),\n",
+    "#                          np.quantile(z_abs_diff,0.95, axis=1),\n",
+    "                         (z_abs_diff**2).mean(axis=1),\n",
+    "                         (1/(z_abs_diff+0.01)).mean(axis=1),\n",
+    "                         np.log(z_abs_diff+1).mean(axis=1)\n",
+    "                        ]\n",
+    "        return features\n",
+    "    \n",
+    "    \n",
+    "#     def is_train_range_index(self, last_index):\n",
+    "#         \"\"\"\n",
+    "#         Train区間内で、self.n_step * self.step_lengthだけのデータが確保可能な区間を指定するindexか判定\n",
+    "#         \"\"\"\n",
+    "#         first_index = last_index - self.n_step * self.step_length\n",
+    "#         if last_index < self.min_index or self.max_index < last_index:\n",
+    "#             # last_indexがデータの定義域を超えている場合False\n",
+    "#             return False\n",
+    "#         elif first_index < self.min_index or self.max_index < first_index:\n",
+    "#             # first_indexがデータの定義域を超えている場合False\n",
+    "#             return False\n",
+    "#         elif self.min_valid_index <= first_index and last_index <= self.max_valid_index:\n",
+    "#             # Validation区間に含まれている場合False\n",
+    "#             return False\n",
+    "#         else:\n",
+    "#             return True"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "data=float_data[:1500000]\n",
+    "data_generator = DataGenerator(acoustic_data=data[:,0], time_to_failures=data[:,1], n_segment=3, n_step=150, step_length=1000, batch_size=5, verbose=0)\n",
+    "data_generator.set_valid_segment(2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 44,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[0, 500000, 1000000, 1499999]"
+      ]
+     },
+     "execution_count": 44,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "data_generator.segment_last_indexs"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "1000000"
+      ]
+     },
+     "execution_count": 30,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "data_generator.min_valid_index"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "1499999"
+      ]
+     },
+     "execution_count": 31,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "data_generator.max_valid_index"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for s,t in data_generator.generate_valid():\n",
+    "    break"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 244,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for s,t in data_generator.generate_train():\n",
+    "    break"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 303,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# # The generator endlessly selects \"batch_size\" ending positions of sub-time series. For each ending position,\n",
+    "# # the \"time_to_failure\" serves as target, while the features are created by the function \"create_X\".\n",
+    "# def generator(data, min_index=0, max_index=None, batch_size=16, n_steps=150, step_length=1000):\n",
+    "#     if max_index is None:\n",
+    "#         max_index = len(data) - 1\n",
+    "    \n",
+    "#     last_index_to_gen_sample = {}\n",
+    "#     while True:\n",
+    "#         # Pick indices of ending positions\n",
+    "#         rows = np.random.randint(min_index + n_steps * step_length, max_index, size=batch_size)\n",
+    "         \n",
+    "#         # Initialize feature matrices and targets\n",
+    "#         samples = np.zeros((batch_size, n_steps, n_features))\n",
+    "#         targets = np.zeros(batch_size, )\n",
+    "        \n",
+    "#         for j, r in enumerate(rows):\n",
+    "#             if r not in last_index_to_gen_sample:\n",
+    "#                 last_index_to_gen_sample[r] = create_X(data[:, 0], last_index=r, n_steps=n_steps, step_length=step_length)\n",
+    "#             samples[j] = last_index_to_gen_sample[r] \n",
+    "#             targets[j] = data[r - 1, 1]\n",
+    "#         yield samples, targets"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 304,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Position of second (of 16) earthquake. Used to have a clean split between train and validation\n",
+    "#second_earthquake = 50085877"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "    #print('n_feature=', n_feature)\n",
+    "    #print('segment_last_indexs=', data_generator.segment_last_indexs)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Train With Folds"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Using TensorFlow backend.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Define model\n",
+    "from keras.models import Sequential\n",
+    "from keras.layers import Dense, CuDNNGRU, Bidirectional\n",
+    "from keras.optimizers import adam\n",
+    "from keras.callbacks import ModelCheckpoint, TensorBoard"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "n_feature= 42\n",
+      "segment_last_indexs= [0, 157286370, 314572740, 471859110, 629145479]\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Initialize generators\n",
+    "batch_size = 32\n",
+    "fold = 4\n",
+    "data_generator = DataGenerator(acoustic_data=float_data[:,0], time_to_failures=float_data[:,1], n_segment=fold, n_step=150, step_length=1000)\n",
+    "n_feature = data_generator.n_feature\n",
+    "print('n_feature=', n_feature)\n",
+    "print('segment_last_indexs=', data_generator.segment_last_indexs)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "//// Fold= 4 ////\n",
+      "Epoch 1/15\n",
+      "1000/1000 [==============================] - 154s 154ms/step - loss: 2.4767 - val_loss: 2.2881\n",
+      "Epoch 2/15\n",
+      "1000/1000 [==============================] - 152s 152ms/step - loss: 2.1349 - val_loss: 2.2395\n",
+      "Epoch 3/15\n",
+      "1000/1000 [==============================] - 152s 152ms/step - loss: 2.1153 - val_loss: 2.3332\n",
+      "Epoch 4/15\n",
+      "1000/1000 [==============================] - 152s 152ms/step - loss: 2.0853 - val_loss: 2.2529\n",
+      "Epoch 5/15\n",
+      "1000/1000 [==============================] - 153s 153ms/step - loss: 2.0842 - val_loss: 2.1274\n",
+      "Epoch 6/15\n",
+      "1000/1000 [==============================] - 153s 153ms/step - loss: 2.0772 - val_loss: 2.1296\n",
+      "Epoch 7/15\n",
+      "1000/1000 [==============================] - 154s 154ms/step - loss: 2.0710 - val_loss: 2.2203\n",
+      "Epoch 8/15\n",
+      "1000/1000 [==============================] - 152s 152ms/step - loss: 2.0722 - val_loss: 2.3591\n",
+      "Epoch 9/15\n",
+      "1000/1000 [==============================] - 153s 153ms/step - loss: 2.0588 - val_loss: 2.1209\n",
+      "Epoch 10/15\n",
+      "1000/1000 [==============================] - 153s 153ms/step - loss: 2.0511 - val_loss: 2.2816\n",
+      "Epoch 11/15\n",
+      "1000/1000 [==============================] - 152s 152ms/step - loss: 2.0393 - val_loss: 2.2671\n",
+      "Epoch 12/15\n",
+      "1000/1000 [==============================] - 153s 153ms/step - loss: 2.0562 - val_loss: 2.1952\n",
+      "Epoch 13/15\n",
+      "1000/1000 [==============================] - 153s 153ms/step - loss: 2.0459 - val_loss: 2.3206\n",
+      "Epoch 14/15\n",
+      " 999/1000 [============================>.] - ETA: 0s - loss: 2.0449"
+     ]
+    }
+   ],
+   "source": [
+    "steps_per_epoch=1000\n",
+    "epochs=15\n",
+    "\n",
+    "fold_to_model = {}\n",
+    "fold_to_history = {}\n",
+    "\n",
+    "for i in [3]: #range(fold):\n",
+    "    print('//// Fold=', i+1, '////')\n",
+    "    # データ区間を設定\n",
+    "    data_generator.set_valid_segment(i)\n",
+    "    train_gen = data_generator.generate_train()\n",
+    "    valid_gen = data_generator.generate_valid()\n",
+    "    #n_feature = data_generator.n_feature\n",
+    "\n",
+    "    cb = [\n",
+    "        ModelCheckpoint(\"../model/model_CuDNNGRU_Fold-\" + str(i+1) + \".hdf5\", save_best_only=True, period=1),\n",
+    "        #TensorBoard(log_dir=\"tflog/\", histogram_freq=1)\n",
+    "    ]\n",
+    "\n",
+    "    model = Sequential()\n",
+    "    model.add(CuDNNGRU(48, input_shape=(None, n_feature)))\n",
+    "    model.add(Dense(10, activation='relu'))\n",
+    "    model.add(Dense(1))\n",
+    "    \n",
+    "    # model.summary()\n",
+    "    \n",
+    "    # Compile and fit model\n",
+    "    model.compile(optimizer=adam(lr=0.0005), loss=\"mae\")\n",
+    "\n",
+    "    history = model.fit_generator(train_gen,\n",
+    "                                  steps_per_epoch=steps_per_epoch,\n",
+    "                                  epochs=epochs,\n",
+    "                                  verbose=1,\n",
+    "                                  callbacks=cb,\n",
+    "                                  validation_data=valid_gen,\n",
+    "                                  validation_steps=50)\n",
+    "    \n",
+    "    # ModelCheckPointで保存したBestモデルを返す\n",
+    "    fold_to_model[i] = model\n",
+    "    fold_to_history[i] = history\n",
+    "    print('')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "i= 0 ../model/model_CuDNNGRU_Fold-1.hdf5\n",
+      "i= 1 ../model/model_CuDNNGRU_Fold-2.hdf5\n",
+      "i= 2 ../model/model_CuDNNGRU_Fold-3.hdf5\n",
+      "i= 3 ../model/model_CuDNNGRU_Fold-4.hdf5\n"
+     ]
+    }
+   ],
+   "source": [
+    "from keras.models import load_model\n",
+    "# returns a compiled model identical to the previous one\n",
+    "models = []\n",
+    "for i in range(fold):\n",
+    "    path_model = \"../model/model_CuDNNGRU_Fold-\" + str(i+1) + \".hdf5\"\n",
+    "    print('i=', i , path_model)\n",
+    "    mdl = load_model(path_model)\n",
+    "    models.append(mdl)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def make_submission(models, dir_input='../input/'):\n",
+    "    \n",
+    "    # Load submission file\n",
+    "    submission = pd.read_csv('../input/sample_submission.csv', index_col='seg_id', dtype={\"time_to_failure\": np.float32})\n",
+    "    \n",
+    "    # Load Test Data\n",
+    "    \n",
+    "    # Load each test data, create the feature matrix, get numeric prediction\n",
+    "    x_test = []\n",
+    "    print('Load test data...')\n",
+    "    for i, seg_id in enumerate(tqdm_notebook(submission.index)):\n",
+    "        seg = pd.read_csv('../input/test/' + seg_id + '.csv')\n",
+    "        x_test_seg = data_generator.convert_test(seg['acoustic_data'].values)\n",
+    "        x_test.append(x_test_seg)\n",
+    "    \n",
+    "    n_test = len(x_test)\n",
+    "    n_sample = x_test[0].shape[1]\n",
+    "    n_feature = x_test[0].shape[2]\n",
+    "    x_test = np.array(x_test).reshape(n_test, n_sample, n_feature)\n",
+    "    \n",
+    "    # Predict Test Data \n",
+    "    print('Predict test data...')\n",
+    "    submission['time_to_failure'] = 0\n",
+    "    for j, mdl in enumerate(tqdm_notebook(models)):\n",
+    "        y_test_mdl = mdl.predict(x_test).ravel()\n",
+    "        submission['time_to_failure_fold_' + str(j+1)] = y_test_mdl\n",
+    "        submission['time_to_failure'] += y_test_mdl/len(models)\n",
+    "    \n",
+    "    return submission"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Load test data...\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "208751864cdc4e69aebf8db89dcd27b4",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, max=2624), HTML(value='')))"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Predict test data...\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "64003a00c7de470cafc95106cd5361d6",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "HBox(children=(IntProgress(value=0, max=4), HTML(value='')))"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "submission = make_submission(models=models, dir_input='../input/')\n",
+    "\n",
+    "# Save\n",
+    "submission.head()\n",
+    "\n",
+    "submission.iloc[:,0:1].to_csv('submission_CuDNNGRU_Fold_'+ str(fold)+'.csv')\n",
+    "submission.to_csv('submission_CuDNNGRU_Fold_'+ str(fold)+'_Full.csv')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "seg = pd.read_csv('../input/test/' + 'seg_00030f.csv')\n",
+    "x_test = []\n",
+    "x_test_seg = data_generator.convert_test(seg['acoustic_data'].values)\n",
+    "\n",
+    "x_test.append(x_test_seg)\n",
+    "x_test.append(x_test_seg)\n",
+    "x_test.append(x_test_seg)\n",
+    "x_test.append(x_test_seg)\n",
+    "\n",
+    "n_test = len(x_test)\n",
+    "n_sample = x_test[0].shape[1]\n",
+    "n_feature = x_test[0].shape[2]\n",
+    "x_test = np.array(x_test).reshape(n_test, n_sample, n_feature)\n",
+    "    \n",
+    "y_test_mdl = models[0].predict(x_test).reshape(-1,1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 39,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "array([[3.8461936],\n",
+       "       [3.8461936],\n",
+       "       [3.8461936],\n",
+       "       [3.8461936]], dtype=float32)"
+      ]
+     },
+     "execution_count": 39,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "y_test_mdl.reshape(-1,1)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>time_to_failure</th>\n",
+       "      <th>time_to_failure_fold_1</th>\n",
+       "      <th>time_to_failure_fold_2</th>\n",
+       "      <th>time_to_failure_fold_3</th>\n",
+       "      <th>time_to_failure_fold_4</th>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>seg_id</th>\n",
+       "      <th></th>\n",
+       "      <th></th>\n",
+       "      <th></th>\n",
+       "      <th></th>\n",
+       "      <th></th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>seg_00030f</th>\n",
+       "      <td>0.704980</td>\n",
+       "      <td>3.846194</td>\n",
+       "      <td>3.447338</td>\n",
+       "      <td>2.891323</td>\n",
+       "      <td>2.819921</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>seg_0012b5</th>\n",
+       "      <td>0.864656</td>\n",
+       "      <td>5.065614</td>\n",
+       "      <td>4.723202</td>\n",
+       "      <td>5.106661</td>\n",
+       "      <td>3.458624</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>seg_00184e</th>\n",
+       "      <td>1.461332</td>\n",
+       "      <td>5.929936</td>\n",
+       "      <td>7.564002</td>\n",
+       "      <td>5.841316</td>\n",
+       "      <td>5.845327</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>seg_003339</th>\n",
+       "      <td>2.104985</td>\n",
+       "      <td>8.411037</td>\n",
+       "      <td>8.581892</td>\n",
+       "      <td>8.191284</td>\n",
+       "      <td>8.419942</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>seg_0042cc</th>\n",
+       "      <td>1.327257</td>\n",
+       "      <td>6.876308</td>\n",
+       "      <td>6.752389</td>\n",
+       "      <td>6.420457</td>\n",
+       "      <td>5.309028</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "            time_to_failure  time_to_failure_fold_1  time_to_failure_fold_2  \\\n",
+       "seg_id                                                                        \n",
+       "seg_00030f         0.704980                3.846194                3.447338   \n",
+       "seg_0012b5         0.864656                5.065614                4.723202   \n",
+       "seg_00184e         1.461332                5.929936                7.564002   \n",
+       "seg_003339         2.104985                8.411037                8.581892   \n",
+       "seg_0042cc         1.327257                6.876308                6.752389   \n",
+       "\n",
+       "            time_to_failure_fold_3  time_to_failure_fold_4  \n",
+       "seg_id                                                      \n",
+       "seg_00030f                2.891323                2.819921  \n",
+       "seg_0012b5                5.106661                3.458624  \n",
+       "seg_00184e                5.841316                5.845327  \n",
+       "seg_003339                8.191284                8.419942  \n",
+       "seg_0042cc                6.420457                5.309028  "
+      ]
+     },
+     "execution_count": 23,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "submission.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#model.summary()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 224,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 1/5\n",
+      "1000/1000 [==============================] - 65s 65ms/step - loss: 2.6927 - val_loss: 1.4755\n",
+      "Epoch 2/5\n",
+      "1000/1000 [==============================] - 80s 80ms/step - loss: 2.3687 - val_loss: 1.4930\n",
+      "Epoch 3/5\n",
+      "1000/1000 [==============================] - 103s 103ms/step - loss: 2.3436 - val_loss: 1.5085\n",
+      "Epoch 4/5\n",
+      "1000/1000 [==============================] - 125s 125ms/step - loss: 2.3249 - val_loss: 1.4234\n",
+      "Epoch 5/5\n",
+      "1000/1000 [==============================] - 117s 117ms/step - loss: 2.3264 - val_loss: 1.4405\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Compile and fit model\n",
+    "model.compile(optimizer=adam(lr=0.0005), loss=\"mae\")\n",
+    "\n",
+    "history = model.fit_generator(train_gen,\n",
+    "                              steps_per_epoch=1000,\n",
+    "                              epochs=5,\n",
+    "                              verbose=1,\n",
+    "                              callbacks=cb,\n",
+    "                              validation_data=valid_gen,\n",
+    "                              validation_steps=50)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model.save(filepath)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 84,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "image/png": "iVBORw0KGgoAAAANSUhEUgAAAXcAAAETCAYAAADNpUayAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAALEgAACxIB0t1+/AAAADl0RVh0U29mdHdhcmUAbWF0cGxvdGxpYiB2ZXJzaW9uIDMuMC4zLCBodHRwOi8vbWF0cGxvdGxpYi5vcmcvnQurowAAIABJREFUeJzt3XucFPWd7vHPw3VAEMNFcEXAmJCoQYc43kAuGoyXddcbuihZJS4hgNHdJCZqjNGYGD0x8ZioMZJViS7KmkRjVEBjZASvOCi4GjWeHMGQg4IgqMAgwvf8UTXQDNMz3cylh5rn/Xr1a7ouXfWdmpqnf/2rripFBGZmli3tSl2AmZk1PYe7mVkGOdzNzDLI4W5mlkEOdzOzDHK4m5llkMPd2gxJgyR92NLLkjRB0kNNsd7Gak21WPNyuGecpB6Snsx5hKRnc4aHFrGs3xQyv6TzJH2ncZXvWgrdNg0sYz9JE3KGT5B0Y6OLszapQ6kLsOYVEWuBo2qGJQVwUkS8uxPLOqPA+W4vdtm7ukK3TQNGAKOB6ekyZwOzm2C51ga55d7GSaqUdJakWelH9t0k/VrSIknPS5qYM+/LkkbnvO5iSY9KWizpAUmd0mkXSZqePp+Qtmpvk/SUpFckHZazzG9KelHSM5LmSPrvOmpsL+l6SS9JWiDpe7Xqz1dHZ0nT0t9lDvAvebbBuZL+lDO8t6R3JXWVdFha27OSnpD06TzLyN02A9N6npb0B+DgWvNekv4uz0j6pRKfAr4DnJB+ojpc0lhJlTmvOy3nU9cfJQ3JmRaSvizpcUmvS7qirjrrqHukpPnpMudLGpkz7fvp9n5a0mXpuD3T321euj2OKGQ9VgIR4UcbegAB9M4ZriRpHe6eDg8AxqfPOwGvA2Xp8MvA6JzXPQmUAQIWAGek0y4CpqfPJwAbgUPS4a8BD6fPBwNLga7p8G9qllGr5l7ARJLGiID5wH4F1HEV8FugXTr8Q+DDOpbfGXgH+GQ6fCnw0/T5CUB5+vxY4M70+aDcZdXaNvOAf0+fdwEeAx7KGZ6cs01nAMfkbKvpOcscC1Smzw8D3gL2SoePSbddzd8tgOtyttcGYM86ftcJObUMBN4GDkiHD0iHBwI9gTVA+/QxPJ3nG8BN6fN9gQGl3qf9qPvhlrtB8s/+fvp8LXCIpCeBPwJ900ddbo6I6kj+018F9skzX2VELEyfv5Iz3yaSQC6T1B7oCvSo4/UfAP2BJ9LHp9Phhuo4AZgWEVvS4Tq7iyJiYzrtvHTUvwK/SJ+vAS6XNJ/kzSHf7wiApG7AMGBauuwNwN05s1STvBHNSZc5vKFlpk4H7omI5elyHycJ4mE581yfTlsFrGD7bVSXE4EnIuLP6ev+TLJ9TwDeAx4h2QfOIHnTBHgY+KKknwN7RMRbBdRuJeBwN0harTWuA3oDx0bEKJKwVJ7Xbcp5HuTfn+qcLyLeBB4EZpG0wF8l7W+u5SKS4wYnRcRIYG6tmvLVUbum+vb3W4AvSRoGvBkRf027dx4Fbo+IEcA55N8WueuvLXe9ZwH/BoxLl3lPAcsknaeuZReyHYpeZiT+Bfg6cBwwV5Ii4nXgcyRvAndK+moBtVsJONyttt2BFyNig6QKYCjQsTlWJKk3UBERR0TEiIi4KCI+zlPTKxGxVtIgYEyBNf0BOF9SB0ntgEvyzZi2QF8Efg7clI7uTNI19Vw6PLGh9UbEOpI3qgvS3/ETJN0wub/L/42ItyX1Ak7NWeYmoFv6utqBfx/wL5L2TKePAvYGnq6vngbMAkZJGpwu87MkB3TnSOoi6Z8jYjHJ730g0ENSObBvRPwOuIKklW+tkMPdarsCOEvSMyQBNY2kb7w5rAbeSA8Azpf0oKRxdcz3v4GDJT2XPr+xwJr+F0k/9UKSfvl5Dcx/I7AHMAcgIj4A/h2Yl3ZT/Rnonr5R1Occ4GhJzwO/A3IPEt8JhKQqku6am3N+l3lAebquITmvISKeBb4NPJhOvwL4p0i+DbVTImIJcDZwR7rM24Cz009UnYB/kvQs8AxwfUSsIXnD+6Wkp4BvAdfs7PqteSnppjRreZLGAl8h6dNdD4wEfhMRvUpamFkG+HvuVkqLSb6JMRvYTPJJcnK9rzCzgrjlbmaWQe5zNzPLIIe7mVkGlazPvXfv3jFo0KBSrd7MbJezcOHCdyOiTyHzlizcBw0aRFVVValWb2a2y5G0tNB53S1jZpZBDnczswxyuJuZZZBPYjJrozZt2sSyZcuorq4udSlWS1lZGf3796djx52/rJPD3ayNWrZsGd27d2fQoEHseJ0yK5WIYNWqVSxbtox99913p5ezS3XLzJgBgwZBu3bJzxkzSl2R2a6rurqaXr16OdhbGUn06tWr0Z+odpmW+4wZMGkSrF+fDC9dmgwDjB9furrMdmUO9tapKf4uu0zL/bLLtgV7jfXrk/FmZra9gsJd0pnpzXznS7pXUtda04ekN819XNLDkna+oyiPt/LczCvfeDNrWk3dLfrhhx8yevRoRo8ezaBBgxg8ePDW4Q0bNjT4+pNOOonVq1fXu/wvfvGLjSuS5ITLXfGgc4PdMpJ6ktwkYER6d57rSO7M8vN0envgVpKbEv9d0j8AHzZ1oQMGJF0xdY03s+bVHN2i3bp1o7KyEoArr7ySfv36MXly4Vd8fuihhxpc/qOPPrpzxWVAgy33iFgNHJXe6BeSN4Tct9VDSe5288P0hr/nA+vqWpakSZKqJFWtXLmyqEKvvhq6dt1+XNeuyXgza14t2S26ZMkS/vEf/5GpU6dy4403smLFCo4//niGDx/O8ccfz/q0kJoW9ZIlSxg5ciQTJkxg2LBhnHzyyWzZktwTvV+/fgBUVlZy6qmnMnbsWCoqKpg6dSoAW7Zs4dxzz+Woo47i+OOP57jjjuP999+vuzDgxz/+MUcccQRHHnkkV6fhs3z5ckaOHMno0aO58MILAbjnnns49NBDGTFiBHPmzGn6jVSAgg6oRkS1pDKS25Z1Zvu7yA8guYP7USQh/yuSu+v8so7lTCO9K3xFRUVRF5KvaR1cdlnSFTNgQBLsPphq1vxaulv0+eef59prr2XIkCG88cYbXHrppYwaNYqrrrqK2bNnc/rpp283/4svvsh//dd/MWDAAL7whS+wePFihg4dut08L7zwAosXL6ZHjx4MHjyY1atX89xzz1FdXc2TTz7JI488wn333cfuu+9eZ01z587lscce46mnnkISJ598MnPmzGHz5s0cfvjhXHfddSxNuxfuu+8+pk+fzn777Vfvm0VzKrTPvT9wPzAnIiZHxOacyWuA+RGxNJI7f/yOpDXf5MaPhyVLYMuW5KeD3axl5Ov+bK5u0f79+zNkSHIb2XXr1nH99dczatQo7r77bj744IMd5j/wwAMZkBaz1157sXbtjreWPfLII9ljjz2QRN++fXn//ffp0aMH69atIyJYu3Ztna+rsXDhQo477jjat29Pu3btOP7446mqquLEE0/kgAMOYMqUKSxYsACAm2++mbvvvptvfetbrFtXZ0dGs2sw3NMW+3RgUkTMrmOWZ4CDJPVNh8eQ3EXezDKipbtFO3XqtPX5lVdeyYQJE3jiiScYO3YsTXn3uKFDh/Lhhx8yatQobrvtNn7wgx/knbe8vJy5c+cSEUQEjz76KOXl5axatYpTTjmFW265hVtvvZU1a9awdu1arr76ai666CK++c1vNlm9xSik5T4G2B+4S1Jl+vhe+rNfeof4C4DfpXdE34PkAKuZZcT48TBtGgwcCFLyc9q0lvn0PGHCBL773e9yyimnsNtuu/G3v/2tyZb93nvv8dFHHwHJmaEzZ87MO++YMWMYPnw4w4cPZ9iwYXz+85/npJNOYvny5Zx55pkMHz6c3r1706NHD2bPns3IkSM5/fTTGTt2bJPVW4yS3UO1oqIifD13s9J59dVX2X///UtdRkndc889LFiwgB//+MesXbuWoUOH8vzzz289EFtKdf19JC2MiIpCXr/LnKFqZtbUDj74YG655Ra++MUvsnHjRiZOnNgqgr0pONzNrM064IADmDdvXqnLaBa7zOUHzMyscA53M7MMcribmWWQw93MLIMc7mZWMuXl5bz66qvbjTvkkEN45ZVXdpi3srKScePGAXDTTTdx99137zDPkiVLOOKII+pd50svvbT1kgC//e1vuf7663e2/K1Gjx7Na6+91ujlNCWHu5mVzFe/+lX+8z//c+vwokWL2H333TnwwAPrfd3XvvY1zj777J1a54UXXrj1UsFjx47lG9/4xk4tp7XzVyHNjP/4D1i0qGmXWV4ON9xQ/zxf+tKXOPjgg7nmmmvo1KkTt912G1OmTOHBBx/kyiuvpH379px11ll8/etf3+51uZcI/tOf/sTFF19M3759t16PBmDFihWcc845fPDBB3Tv3p377ruPRx55hEWLFjFu3Litlxd+7bXXuPbaa/nrX//KlClT+Oijj+jQoQM333wzn/nMZ5gwYQJ77bUXCxcuZNmyZfzsZz/j2GOPzfs73XXXXdx888106NCBoUOHcsMNN1BdXc3YsWNZv349++yzD7fddhtPP/00F198MWVlZZx33nlMmDBhp7d1XdxyN7OS6d69O8ceeywPPPAAGzduZO7cuZx66qls2rSJxx57jGeffZY777wz7+sjgq985Svcf//9PPzww5SXl2+dtnbtWi699FKeeuophg0bxuzZszn11FMpLy9n5syZO4Tpl7/8ZS6//HIqKyv50Y9+tN309evX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\n",
+      "text/plain": [
+       "<Figure size 432x288 with 1 Axes>"
+      ]
+     },
+     "metadata": {
+      "needs_background": "light"
+     },
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "# Visualize accuracies\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "def perf_plot(history, what = 'loss'):\n",
+    "    x = history.history[what]\n",
+    "    val_x = history.history['val_' + what]\n",
+    "    epochs = np.asarray(history.epoch) + 1\n",
+    "    \n",
+    "    plt.plot(epochs, x, 'bo', label = \"Training \" + what)\n",
+    "    plt.plot(epochs, val_x, 'b', label = \"Validation \" + what)\n",
+    "    plt.title(\"Training and validation \" + what)\n",
+    "    plt.xlabel(\"Epochs\")\n",
+    "    plt.legend()\n",
+    "    plt.show()\n",
+    "    return None\n",
+    "\n",
+    "perf_plot(history)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Load submission file\n",
+    "submission = pd.read_csv('../input/sample_submission.csv', index_col='seg_id', dtype={\"time_to_failure\": np.float32})\n",
+    "\n",
+    "# Load each test data, create the feature matrix, get numeric prediction\n",
+    "for i, seg_id in enumerate(tqdm(submission.index)):\n",
+    "  #  print(i)\n",
+    "    seg = pd.read_csv('../input/test/' + seg_id + '.csv')\n",
+    "    x = seg['acoustic_data'].values\n",
+    "    submission.time_to_failure[i] = model.predict(np.expand_dims(create_X(x), 0))\n",
+    "\n",
+    "submission.head()\n",
+    "\n",
+    "# Save\n",
+    "submission.to_csv('submission.csv')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# https://www.kaggle.com/suicaokhoailang/lstm-attention-baseline-0-652-lb\n",
+    "from keras import activations, regularizers, initializers, constraints\n",
+    "from keras.engine import Layer, InputSpec\n",
+    "\n",
+    "class Attention(Layer):\n",
+    "    def __init__(self, step_dim,\n",
+    "                 W_regularizer=None, b_regularizer=None,\n",
+    "                 W_constraint=None, b_constraint=None,\n",
+    "                 bias=True, **kwargs):\n",
+    "        self.supports_masking = True\n",
+    "        self.init = initializers.get('glorot_uniform')\n",
+    "\n",
+    "        self.W_regularizer = regularizers.get(W_regularizer)\n",
+    "        self.b_regularizer = regularizers.get(b_regularizer)\n",
+    "\n",
+    "        self.W_constraint = constraints.get(W_constraint)\n",
+    "        self.b_constraint = constraints.get(b_constraint)\n",
+    "\n",
+    "        self.bias = bias\n",
+    "        self.step_dim = step_dim\n",
+    "        self.features_dim = 0\n",
+    "        super(Attention, self).__init__(**kwargs)\n",
+    "\n",
+    "    def build(self, input_shape):\n",
+    "        assert len(input_shape) == 3\n",
+    "\n",
+    "        self.W = self.add_weight((input_shape[-1],),\n",
+    "                                 initializer=self.init,\n",
+    "                                 name='{}_W'.format(self.name),\n",
+    "                                 regularizer=self.W_regularizer,\n",
+    "                                 constraint=self.W_constraint)\n",
+    "        self.features_dim = input_shape[-1]\n",
+    "\n",
+    "        if self.bias:\n",
+    "            self.b = self.add_weight((input_shape[1],),\n",
+    "                                     initializer='zero',\n",
+    "                                     name='{}_b'.format(self.name),\n",
+    "                                     regularizer=self.b_regularizer,\n",
+    "                                     constraint=self.b_constraint)\n",
+    "        else:\n",
+    "            self.b = None\n",
+    "\n",
+    "        self.built = True\n",
+    "\n",
+    "    def compute_mask(self, input, input_mask=None):\n",
+    "        return None\n",
+    "\n",
+    "    def call(self, x, mask=None):\n",
+    "        features_dim = self.features_dim\n",
+    "        step_dim = self.step_dim\n",
+    "\n",
+    "        eij = K.reshape(K.dot(K.reshape(x, (-1, features_dim)),\n",
+    "                        K.reshape(self.W, (features_dim, 1))), (-1, step_dim))\n",
+    "\n",
+    "        if self.bias:\n",
+    "            eij += self.b\n",
+    "\n",
+    "        eij = K.tanh(eij)\n",
+    "\n",
+    "        a = K.exp(eij)\n",
+    "\n",
+    "        if mask is not None:\n",
+    "            a *= K.cast(mask, K.floatx())\n",
+    "\n",
+    "        a /= K.cast(K.sum(a, axis=1, keepdims=True) + K.epsilon(), K.floatx())\n",
+    "\n",
+    "        a = K.expand_dims(a)\n",
+    "        weighted_input = x * a\n",
+    "        return K.sum(weighted_input, axis=1)\n",
+    "\n",
+    "    def compute_output_shape(self, input_shape):\n",
+    "        return input_shape[0],  self.features_dim"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# This is NN LSTM Model creation\n",
+    "def model_lstm(input_shape, feat_shape):\n",
+    "    inp = Input(shape=(input_shape[1], input_shape[2],))\n",
+    "    feat = Input(shape=(feat_shape[1],))\n",
+    "\n",
+    "    bi_lstm = Bidirectional(CuDNNLSTM(128, return_sequences=True), merge_mode='concat')(inp)\n",
+    "    bi_gru = Bidirectional(CuDNNGRU(64, return_sequences=True), merge_mode='concat')(bi_lstm)\n",
+    "    \n",
+    "    attention = Attention(input_shape[1])(bi_gru)\n",
+    "    \n",
+    "    x = concatenate([attention, feat], axis=1)\n",
+    "    x = Dense(64, activation=\"relu\")(x)\n",
+    "    x = Dense(1, activation=\"sigmoid\")(x)\n",
+    "    \n",
+    "    model = Model(inputs=[inp, feat], outputs=x)\n",
+    "    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=[matthews_correlation])\n",
+    "    \n",
+    "    return model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# def classic_sta_lta(x, length_sta, length_lta):\n",
+    "#     \"\"\"\n",
+    "#     STA/LTA (short-term average/long-term average)\n",
+    "#     For noise-free seismograms, the maximum value of the numerical derivative of the STA/LTA ratio is close to the time of the first arrival.\n",
+    "#     (https://en.wikipedia.org/wiki/First_break_picking)\n",
+    "#     length_staだけズラした波形の振幅の累積二乗の比率/length_finだけズラした波形の振幅の累積二乗の比率\n",
+    "#     \"\"\"\n",
+    "#     sta = np.cumsum(x ** 2)\n",
+    "\n",
+    "#     # Convert to float\n",
+    "#     sta = np.require(sta, dtype=np.float)\n",
+    "\n",
+    "#     # Copy for LTA\n",
+    "#     lta = sta.copy()\n",
+    "\n",
+    "#     # Compute the STA and the LTA\n",
+    "#     sta[length_sta:] = sta[length_sta:] - sta[:-length_sta]\n",
+    "#     sta /= length_sta\n",
+    "#     sta[:length_lta - 1] = 0 # Pad zeros\n",
+    "    \n",
+    "#     lta[length_lta:] = lta[length_lta:] - lta[:-length_lta]\n",
+    "#     lta /= length_lta\n",
+    "#     # Avoid division by zero by setting zero values to tiny float\n",
+    "#     dtiny = np.finfo(0.0).tiny\n",
+    "#     idx = lta < dtiny\n",
+    "#     lta[idx] = dtiny\n",
+    "\n",
+    "#     return sta / lta\n",
+    "\n",
+    "# def max_abs_diff_calssic_sta_lat(x, length_sta, length_lta):\n",
+    "#     \"\"\"\n",
+    "#     x:1D-array(m*1)\n",
+    "#     return:float\n",
+    "#     \"\"\"\n",
+    "#     csl = classic_sta_lta(x, length_sta, length_lta)\n",
+    "#     return np.abs(np.diff(csl)).max()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# def add_trend_feature(mat, abs_values=False):\n",
+    "#     \"\"\"\n",
+    "#     単回帰を用いてデータの平均傾きを出力\n",
+    "#     \"\"\"\n",
+    "#     trends = np.zeros([mat.shape[0],1])\n",
+    "#     for i in range(mat.shape[0]):\n",
+    "#         arr = mat[i]\n",
+    "#         idx = np.array(range(len(arr)))\n",
+    "#         if abs_values:\n",
+    "#             arr = np.abs(arr)\n",
+    "#         lr = LinearRegression()\n",
+    "#         lr.fit(idx.reshape(-1, 1), arr)\n",
+    "#         trends[i] = lr.coef_[0]\n",
+    "#     return trends"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# # Helper function for the data generator. Extracts mean, standard deviation, and quantiles per time step.\n",
+    "# # Can easily be extended. Expects a two dimensional array.\n",
+    "# def extract_features(z):\n",
+    "#     \"\"\"\n",
+    "#     z:2D-array(m*n)\n",
+    "#     return:features(m*x)\n",
+    "#     \"\"\"\n",
+    "#     features = np.c_[z.mean(axis=1), \n",
+    "#                      z.min(axis=1),\n",
+    "#                      z.max(axis=1),\n",
+    "#                      z.std(axis=1),\n",
+    "                               \n",
+    "#                      np.abs(z).mean(axis=1),\n",
+    "#                      np.abs(z).std(axis=1),\n",
+    "\n",
+    "#                      np.median(z, axis=1),\n",
+    "#                      stats.kurtosis(z, axis=1),\n",
+    "#                      stats.skew(z, axis=1),\n",
+    "\n",
+    "#                      #np.abs(hilbert(x_in)).mean()\n",
+    "#                      #convolve(x_in, hann(150), mode='same') / sum(hann(150))).mean()\n",
+    "\n",
+    "\n",
+    "#                      #     for i in range(z.shape[0]): \n",
+    "#                     #         zs_i = pd.Series(z[i])   \n",
+    "\n",
+    "#                     #         if z.shape[1] >= 100:\n",
+    "#                     #             #df_ext.loc[i, 'mad_stalat_10-50'] = max_abs_diff_calssic_sta_lat(zs_i, length_sta=10, length_lta=50)\n",
+    "#                     #             #df_ext.loc[i, 'mad_stalat_33-66'] = max_abs_diff_calssic_sta_lat(zs_i, length_sta=33, length_lta=66)\n",
+    "#                     #             df_ext.loc[i, 'mad_stalat_33-99'] = max_abs_diff_calssic_sta_lat(zs_i, length_sta=33, length_lta=99)\n",
+    "#                     #         if z.shape[1] >= 150:\n",
+    "#                     #             #df_ext.loc[i, 'mad_stalat_10-100'] = max_abs_diff_calssic_sta_lat(zs_i, length_sta=10, length_lta=100)\n",
+    "#                     #             # df_ext.loc[i, 'mad_stalat_33-123'] = max_abs_diff_calssic_sta_lat(zs_i, length_sta=33, length_lta=123)\n",
+    "#                     #             df_ext.loc[i, 'mad_stalat_40-100'] = max_abs_diff_calssic_sta_lat(zs_i, length_sta=40, length_lta=100)\n",
+    "#                     #             #df_ext.loc[i, 'mad_stalat_50-150'] =  max_abs_diff_calssic_sta_lat(zs_i, length_sta=50, length_lta=150)\n",
+    "\n",
+    "#                     #         # Windowを変化させrolling特徴量を生成\n",
+    "#                     #         for window in [10]: #,30]:\n",
+    "#                     #             if z.shape[1] < window+10:\n",
+    "#                     #                 continue    \n",
+    "#                     #             z_roll_std = zs_i.rolling(window).std().dropna().values\n",
+    "#                     #             z_roll_mean = zs_i.rolling(window).mean().dropna().values   \n",
+    "\n",
+    "#                     #             df_ext.loc[i, 'ave_roll_std_wd_' + str(window)] = z_roll_std.mean()          \n",
+    "#                     #             df_ext.loc[i, 'std_roll_std_wd_' + str(window)] = z_roll_std.std()\n",
+    "#                     # #             df_ext.loc[i, 'max_roll_std_wd_' + str(window)] = z_roll_std.max()\n",
+    "#                     # #             df_ext.loc[i, 'min_roll_std_wd_' + str(window)] = z_roll_std.min()\n",
+    "#                     #             df_ext.loc[i, 'ave_roll_mean_wd_' + str(window)] = z_roll_mean.mean()\n",
+    "#                     #             df_ext.loc[i, 'std_roll_mean_wd_' + str(window)] = z_roll_mean.std()\n",
+    "#                     # #             df_ext.loc[i, 'max_roll_mean_wd_' + str(window)] = z_roll_mean.max()\n",
+    "#                     # #             df_ext.loc[i, 'min_roll_mean_wd_' + str(window)] = z_roll_mean.min()\n",
+    "\n",
+    "#                     #     df_ext.dropna(axis=1, inplace=True)\n",
+    "#                 ]\n",
+    "#     return features"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# # For a given ending position \"last_index\", we split the last 150'000 values \n",
+    "# # of \"x\" into 150 pieces of length 1000 each. So n_steps * step_length should equal 150'000.\n",
+    "# # From each piece, a set features are extracted. This results in a feature matrix \n",
+    "# # of dimension (150 time steps x features).  \n",
+    "# def create_X(x, last_index=None, n_steps=150, step_length=1000):\n",
+    "#     if last_index == None:\n",
+    "#         last_index=len(x)\n",
+    "       \n",
+    "#     assert last_index - n_steps * step_length >= 0\n",
+    "\n",
+    "#     # Reshaping and approximate standardization with mean 5 and std 3.\n",
+    "#     temp = (x[(last_index - n_steps * step_length):last_index].reshape(n_steps, -1) - 5 ) / 3\n",
+    "    \n",
+    "#     # Extracts features of sequences of full length 1000, of the last 100 and 10 observations. \n",
+    "#     return np.c_[extract_features(temp),\n",
+    "#                  extract_features(temp[:, -step_length // 10:]),\n",
+    "#                  extract_features(temp[:, -step_length // 100:])]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# # Query \"create_X\" to figure out the number of features\n",
+    "# data_tr = create_X(float_data[0:150000])\n",
+    "# n_features = data_tr.shape[1]\n",
+    "# print(\"Our RNN is based on %i features\"% n_features)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.5.6"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
